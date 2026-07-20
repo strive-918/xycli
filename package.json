@@ -4,7 +4,7 @@
   "description": "A terminal-native AI coding agent",
   "type": "module",
   "bin": {
-    "xycli": "./dist/cli.js"
+    "xycli": "./dist/src/cli.js"
   },
   "scripts": {
     "build": "tsc",
