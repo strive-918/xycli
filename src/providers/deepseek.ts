@@ -171,6 +171,12 @@ export class DeepSeekProvider implements IProvider {
   async chat(request: ProviderRequest): Promise<ProviderResponse> {
     try {
       const messages = toOpenAIMessages(request.messages);
+
+      // 将 system prompt 作为第一条消息插入
+      if (request.system) {
+        messages.unshift({ role: "system", content: request.system });
+      }
+
       const tools = request.tools.length > 0 ? toOpenAITools(request.tools) : undefined;
 
       // DeepSeek 目前只支持非流式 tool calling
@@ -211,6 +217,12 @@ export class DeepSeekProvider implements IProvider {
   async *streamChat(request: ProviderRequest): AsyncIterable<ProviderStreamEvent> {
     try {
       const messages = toOpenAIMessages(request.messages);
+
+      // 将 system prompt 作为第一条消息插入
+      if (request.system) {
+        messages.unshift({ role: "system", content: request.system });
+      }
+
       const tools = request.tools.length > 0 ? toOpenAITools(request.tools) : undefined;
 
       const stream = await this.client.chat.completions.create({
