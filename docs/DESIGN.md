@@ -1,354 +1,194 @@
 # XYCLI 详细设计
 
-> Rust 迁移说明：本文保留完整目标设计。当前核心运行时已迁移到 Rust，实际模块和完成边界以 `ARCHITECTURE.md` 与 `RUST_MIGRATION.md` 为准。
+> 当前版本：Rust-only v0.2.0 基线。本文描述已经实现的核心边界；尚未实现的设计集中记录在 `NEXT_PHASE_DESIGN.md`。
 
-> 当前版本：M1 稳定化基线。本文中的“当前实现”可直接对应代码；“后续设计”属于 M2–M10。
-
-## 1. 模块划分
+## 1. 工作区与依赖方向
 
 ```text
-src/
-├── cli.ts                 # CLI 入口与 REPL
-├── core/
-│   ├── agent-loop.ts      # Agent 状态机
-│   ├── permission-guard.ts
-│   ├── prompts.ts
-│   ├── errors.ts
-│   └── types.ts
-├── providers/
-│   ├── anthropic.ts
-│   ├── deepseek.ts
-│   └── types.ts
-├── session/
-│   ├── json-store.ts
-│   └── types.ts
-└── tools/
-    ├── registry.ts
-    ├── path-policy.ts
-    ├── file-read.ts
-    ├── file-write.ts
-    ├── terminal-exec.ts
-    └── types.ts
+Cargo workspace
+├── crates/xycli-cli
+│   ├── clap 参数解析
+│   ├── 单次任务与 REPL
+│   ├── Ctrl+C 取消
+│   └── 进程退出码
+└── crates/xycli-core
+    ├── agent.rs
+    ├── provider.rs
+    ├── permission.rs
+    ├── prompt.rs
+    ├── session.rs
+    ├── error.rs
+    └── tools/
 ```
 
-依赖方向：
+依赖方向固定为：
 
 ```text
-CLI → Core → Provider 接口
-           → ToolRegistry 接口
-           → SessionStore 接口
-Tool → Core 基础类型
-Provider → Core 错误类型
-Session → Core 状态类型
+xycli-cli → xycli-core
+Agent → Provider trait
+      → ToolRegistry
+      → SessionStore trait
+Tool → PermissionMode + 工作区策略
 ```
 
-Core 不直接创建具体 Provider、工具或存储，由 CLI 注入实现。
+`xycli-core` 不读取终端输入，也不创建具体界面，CLI 负责组合 Provider、工具和存储。新增桌面端或服务端时应复用核心库，而不是复制 Agent 循环。
 
-## 2. 工具接口
+## 2. Agent 运行时
 
-```ts
-interface ITool<TInput extends object, TOutput> {
-  name: string;
-  description: string;
-  inputSchema: JSONSchema7;
-  inputValidator: ZodType<TInput>;
-  permissionLevel: PermissionLevel;
-  defaultTimeoutMs: number;
-  idempotencyKey(input: TInput, context: ToolExecutionContext): string;
-  execute(input: TInput, context: ToolExecutionContext): Promise<ToolResult<TOutput>>;
+`AgentRunConfig` 输入 prompt、model、max_turns、cwd、Provider、ToolRegistry、SessionStore、权限模式、取消令牌和可选会话 ID。`run_agent` 负责：
+
+1. 校验 prompt 和轮次；
+2. 创建或恢复会话；
+3. 构建系统提示词和工具 Schema；
+4. 请求 Provider；
+5. 记录文本、Token 与工具调用；
+6. 执行权限检查和工具调用；
+7. 将结果写回上下文并继续下一轮；
+8. 保存完成、未完成、中断或错误终态。
+
+状态机：
+
+```text
+Idle → Planning → Acting → Observing
+                 ↑         │
+                 └─────────┘
+
+任意运行态 → Completed | Incomplete | Interrupted | Error
+```
+
+只有 `Completed` 返回退出码 0。达到最大轮次和模型输出截断都属于 `Incomplete`，不能伪装为成功。
+
+## 3. Provider
+
+`Provider` trait 当前提供：
+
+```rust
+#[async_trait]
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn chat(&self, request: ProviderRequest) -> XycliResult<ProviderResponse>;
+    fn supports_tools(&self, model: &str) -> bool;
 }
 ```
 
-`inputSchema` 用于向模型描述工具，`inputValidator` 是运行时权威校验。ToolRegistry 必须先校验再计算幂等键和执行，防止无效模型参数进入工具实现。
+内部消息统一表示文本、工具调用和工具结果。Anthropic 与 DeepSeek 只负责厂商协议转换、认证、HTTP 错误映射和响应归一化，不参与 Agent 状态决策。
 
-### 2.1 执行上下文
+当前请求超时为 180 秒，并响应 `CancellationToken`。HTTP 408、409、429、500、502、503、504 会被标记为可重试，但重试策略尚未执行。
 
-```ts
-interface ToolExecutionContext {
-  sessionId: string;
-  callId: string;
-  cwd: string;
-  env: Record<string, string>;
-  signal: AbortSignal;
-  permissions: PermissionPolicy;
-  logger: StructuredLogger;
-  startedAt: string;
-}
+## 4. 工具注册与结果
+
+每个 Tool 声明名称、描述、JSON Schema、权限级别、默认超时和异步执行逻辑。ToolRegistry 的固定顺序是：
+
+```text
+查找工具
+  → 检查 PermissionMode
+  → 工具输入严格校验
+  → 创建超时与子取消令牌
+  → 执行工具
+  → 归一化 ToolResult
 ```
 
-ToolRegistry 将工具默认超时和上游中断信号合并。执行结束后必须清理定时器和事件监听器。
+模型输入使用 `serde_json::Value`，每个工具实现是运行时权威校验器。业务失败通过结构化结果返回模型；基础设施错误才升级为 Agent 错误。
 
-### 2.2 统一结果
+## 5. 内置工具
 
-```ts
-interface ToolResult<TOutput> {
-  success: boolean;
-  output: TOutput | null;
-  error: ToolErrorPayload | null;
-  durationMs: number;
-  startedAt: string;
-  endedAt: string;
-  metadata: Record<string, unknown>;
-}
-```
+### 5.1 file_read
 
-工具业务失败通过结果返回，不抛出到 Agent Loop；只有编程错误或无法恢复的基础设施异常才允许抛出。
+- 只接受工作区内相对路径；
+- 支持行范围和读取大小上限；
+- 返回内容、范围、截断标记和 SHA-256；
+- 已存在目标必须通过真实路径检查。
 
-## 3. 内置工具
+### 5.2 file_write
 
-### 3.1 `file_read`
+- 内容最大 2 MiB；
+- 可用 `expectedSha256` 防止覆盖用户并发修改；
+- 待创建路径通过最近已存在祖先解析符号链接；
+- 写入同目录唯一临时文件后原子重命名；
+- 返回写入前后哈希与差异。
 
-输入：
+### 5.3 terminal_exec
 
-- `path`：必填，工作区内文件；
-- `startLine`、`endLine`：可选，1 开始且范围有效；
-- `maxBytes`：可选，不超过 2 MiB。
+- `command` 是单个程序名，参数只能放入 `args`；
+- 使用 `tokio::process::Command`，不调用 shell；
+- 工作目录必须位于工作区；
+- stdout、stderr 各自限制保留 100,000 字节；
+- 超时或取消时终止子进程；
+- `auto-safe` 只允许受限的 `pwd`、`echo`、`ls`、`git status/diff/log/show`。
 
-输出包含内容、行范围、截断标记和 SHA-256。真实路径必须位于工作区内。
+## 6. 权限与安全
 
-### 3.2 `file_write`
+权限模式使用显式矩阵：
 
-输入：
-
-- `path`：必填，工作区内目标；
-- `content`：必填，最大 2 MiB；
-- `createIfMissing`：默认允许创建；
-- `expectedSha256`：可选，用于防止覆盖并发修改。
-
-写入流程：
-
-1. 校验目标和真实父目录没有逃逸工作区；
-2. 读取旧内容并检查预期哈希；
-3. 写入带随机后缀的临时文件；
-4. 原子重命名；
-5. 返回前后哈希与 unified diff；
-6. 失败时尽力清理临时文件。
-
-### 3.3 `terminal_exec`
-
-输入：
-
-- `command`：单个可执行文件名；
-- `args`：参数数组；
-- `cwd`：工作区内目录；
-- `timeoutMs`：最大 120 秒；
-- `env`：仅 `full-access` 允许覆盖。
-
-执行固定使用 `shell: false`。`auto-safe` 白名单只包含 `pwd`、`echo`、`ls` 和受限的 `git status/diff/log/show`。安全命令会从工作区外的绝对 PATH 目录解析为真实可执行文件，避免仓库内同名程序劫持；Git 参数拒绝仓库切换、外部 diff、输出文件和命令执行能力。
-
-## 4. 路径策略
-
-路径策略分为三种入口：
-
-- `resolveExistingWorkspacePath()`：读取已存在目标；
-- `resolveWritableWorkspacePath()`：处理可能尚未创建的目标；
-- `resolveWorkspaceDirectory()`：验证命令工作目录。
-
-判断条件：
-
-```ts
-const relative = path.relative(workspaceRoot, realTarget);
-const allowed =
-  relative === "" ||
-  (!relative.startsWith(`..${path.sep}`) &&
-   relative !== ".." &&
-   !path.isAbsolute(relative));
-```
-
-不允许只做字符串前缀比较，因为 `/repo-other` 可能错误匹配 `/repo`。对待创建文件必须先解析最近的已存在父目录，才能识别中间符号链接。
-
-## 5. 权限模型
-
-```ts
-type PermissionLevel =
-  | "read-only"
-  | "write-files"
-  | "run-safe-commands"
-  | "network"
-  | "full-access";
-
-type PermissionMode = "read-only" | "auto-safe" | "full-access";
-```
-
-允许矩阵：
-
-| 模式 | 权限级别 |
+| 模式 | 能力 |
 | --- | --- |
-| `read-only` | `read-only` |
-| `auto-safe` | `read-only`、`write-files`、`run-safe-commands` |
-| `full-access` | 全部 |
+| `read-only` | 只读工具 |
+| `auto-safe` | 工作区读写与安全命令 |
+| `full-access` | 全部工具级能力与任意本地程序 |
 
-PermissionGuard 负责工具级检查；文件和终端工具继续执行动作级检查。两层都通过后才能产生副作用。
-
-## 6. Agent 循环
-
-### 6.1 输入配置
-
-```ts
-interface AgentRunConfig {
-  prompt: string;
-  model: string;
-  maxTurns: number;
-  cwd: string;
-  provider: IProvider;
-  toolRegistry: ToolRegistry;
-  sessionStore: SessionStore;
-  permissionMode?: PermissionMode;
-  signal?: AbortSignal;
-  sessionId?: string;
-}
-```
-
-设置 `sessionId` 时加载已有会话并追加用户消息，用于 REPL 上下文保持。
-
-### 6.2 状态机
+安全边界分三层：
 
 ```text
-IDLE
-  → PLANNING
-  → ACTING
-  → OBSERVING
-  ├── PLANNING
-  ├── COMPLETED
-  ├── INCOMPLETE
-  └── ERROR
+工具级权限矩阵
+  → 输入 Schema 和范围校验
+    → 文件真实路径或命令语义策略
 ```
 
-会话终态：
+新增权限级别时必须默认拒绝；不能依赖枚举顺序自动放行。项目指令、模型输出和插件声明都不能提升 CLI 选择的权限模式。
 
-- `completed`：模型正常结束；
-- `incomplete`：达到最大轮次或模型输出被截断；
-- `interrupted`：用户发出中断；
-- `error`：Provider 或系统错误。
+## 7. 会话持久化
 
-只有 `completed` 返回退出码 0。
+`SessionStore` 隔离存储实现，当前 `JsonSessionStore` 将会话写入 `.xycli/sessions/json/<uuid>.json`：
 
-### 6.3 单轮步骤
+- 字段使用 `camelCase`；
+- 临时文件与目标文件在同一目录；
+- 原子重命名避免半截 JSON；
+- 单进程内异步互斥避免同时覆盖；
+- 损坏的单个文件不阻断列表读取。
 
-1. 检查中断；
-2. 从 Session 构造 Provider 消息；
-3. 发送带 AbortSignal 的请求；
-4. 记录助手消息和 Token；
-5. 正常文本则完成；
-6. 工具调用则逐个进行权限检查和执行；
-7. 将工具结果写回会话；
-8. 进入下一轮。
+恢复会话时要求工作目录一致，防止历史上下文被带到另一个仓库执行。
 
-## 7. Provider 设计
+## 8. CLI 与退出码
 
-```ts
-interface IProvider {
-  name: "anthropic" | "openai" | "generic-openai";
-  chat(request: ProviderRequest): Promise<ProviderResponse>;
-  streamChat(request: ProviderRequest): AsyncIterable<ProviderStreamEvent>;
-  supportsTools(model: string): boolean;
-  estimateTokens(input: ProviderTokenInput): Promise<TokenEstimate>;
-}
-```
-
-### 7.1 Anthropic
-
-- `system` 使用 Messages API 独立字段；
-- `tool_use` 和 `tool_result` 转换为内部内容块；
-- 流式结束通过 SDK `finalMessage()` 获取完整文本和工具 JSON；
-- SDK 客户端可注入，便于无网络测试。
-
-### 7.2 DeepSeek
-
-- 使用 OpenAI Chat Completions 兼容协议；
-- 系统提示词插入首条 `system` 消息；
-- 流式工具参数按 `index` 累积字符串，结束后统一解析；
-- `DEEPSEEK_BASE_URL` 仅用于兼容网关和测试；
-- SDK 客户端可注入。
-
-### 7.3 后续 Provider 工厂
-
-M3 将把 CLI 中的创建逻辑迁入 Provider Factory，并加入配置优先级、重试、熔断和 fallback。
-
-## 8. 会话设计
-
-```ts
-interface Session {
-  id: string;
-  title: string;
-  cwd: string;
-  status: SessionStatus;
-  currentState: AgentLoopState;
-  providerName: string;
-  model: string;
-  messages: Message[];
-  toolCalls: ToolCallRecord[];
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  createdAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-}
-```
-
-JSON 文件是 M1 权威存储。`create()` 和 `update()` 都使用临时文件加重命名。M4 迁移 SQLite 时保持 `SessionStore` 接口稳定。
-
-## 9. CLI 设计
-
-CLI 使用 `program.parseAsync()`，所有异步 action 的异常交给顶层处理。退出码：
+CLI 支持单次 prompt、stdin 和 REPL。REPL 串行处理输入并通过会话 ID 延续上下文；`/new` 创建新会话，`/model` 和 `/turns` 修改后续请求配置。
 
 | 退出码 | 含义 |
 | ---: | --- |
-| 0 | 成功完成 |
-| 1 | 一般错误、未完成或中断 |
-| 2 | 参数或配置校验失败 |
-| 3 | 权限拒绝 |
-| 4 | Provider 错误 |
+| 0 | 正常完成 |
+| 1 | 未完成、中断或一般运行错误 |
+| 2 | 参数或配置错误 |
+| 3 | 顶层权限错误 |
+| 4 | Provider 或网络错误 |
 | 5 | 工具致命错误 |
 
-REPL 使用 `for await...of` 串行处理输入；同一会话通过 `sessionId` 延续；`/new` 清除当前会话引用。
+## 9. 测试分层
 
-## 10. 错误处理
+1. 单元测试：权限矩阵、协议解析、命令规则和 Agent 状态；
+2. Agent 测试：MockProvider、多轮工具调用、轮次上限和会话落盘；
+3. 安全集成测试：路径逃逸、符号链接、哈希冲突、命令注入和权限拒绝；
+4. Provider HTTP 测试：本机临时服务检查 URL、认证头、请求体和响应解析；
+5. CLI 进程测试：真实二进制参数、stdin、退出码和本地模拟 API。
 
-所有领域错误继承 `XycliError`，包含：
+所有默认测试必须离线运行，不使用真实 API Key。
 
-- `code`；
-- `exitCode`；
-- `retryable`；
-- `details`。
+## 10. 构建与发布
 
-ProviderError 可以从 details 中读取真实 `retryable`，避免所有错误都被错误标记为可重试。
+唯一构建链是 Cargo：
 
-工具输入错误返回 `INVALID_TOOL_INPUT`；路径越界返回 `PATH_OUTSIDE_WORKSPACE`；安全命令拒绝返回 `UNSAFE_COMMAND`。
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo build --workspace --release
+```
 
-## 11. 测试设计
+本地全局安装使用 `cargo install --path crates/xycli-cli --locked --force`。正式跨平台发布将在 CI 中生成签名或校验和明确的二进制归档。
 
-测试分层：
+## 11. 演进约束
 
-1. 工具和权限单元测试；
-2. Agent Loop 与 JsonSessionStore 集成测试；
-3. Provider 模拟 SDK 测试；
-4. Agent 全流程模拟 Provider 测试；
-5. 真实 CLI 子进程 E2E。
-
-真实 CLI E2E 在子进程中预加载测试专用 fetch 模拟模块，不访问公网，但完整覆盖 CLI 参数、SDK 请求格式、工具调用、会话落盘和退出码。
-
-真实 API 冒烟测试只有在显式提供 API Key 时运行，不作为离线 CI 的必要条件。
-
-## 12. 构建与打包
-
-- `tsconfig.json`：类型检查与测试开发；
-- `tsconfig.build.json`：只编译生产源码；
-- `prebuild`：清理可再生的 `dist`；
-- `postbuild`：为 `dist/cli.js` 设置可执行权限；
-- `files: ["dist"]`：限制 npm 发布内容；
-- `prepack`：打包前重新生产构建。
-
-## 13. 后续设计
-
-### M2
-
-统一 Renderer、真实流式 UI、搜索、Web 和 Git 专用工具。
-
-### M3
-
-配置加载、OpenAI Provider、Provider Factory、重试、熔断与 fallback。
-
-### M4–M10
-
-SQLite 与 resume、Plan、Memory、Computer Use、MCP、插件、审批、脱敏、回滚、诊断与 CI/CD。后续模块必须继续通过现有 Provider、Tool 和 Session 接口接入，避免绕过权限与审计边界。
+- 流式输出通过事件接口进入 Renderer，不能让 Provider 直接打印终端；
+- 重试只包围单次 Provider 请求，不能重放已成功的工具副作用；
+- 审批发生在工具输入校验之后、副作用之前；
+- MCP 与插件工具必须进入同一个 ToolRegistry、权限和审计链；
+- SQLite 替换 JSON 时保持 `SessionStore` 领域边界；
+- Computer Use 在审批、审计、恢复和跨平台发布成熟前不进入主线。

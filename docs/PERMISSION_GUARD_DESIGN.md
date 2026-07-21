@@ -1,6 +1,6 @@
 # PermissionGuard 与工具安全边界设计
 
-> Rust 迁移说明：当前生产权限矩阵位于 `crates/xycli-core/src/permission.rs`，工具执行层位于 `crates/xycli-core/src/tools/`；本文保留原始安全设计和历史实现依据。
+> 当前生产权限矩阵位于 `crates/xycli-core/src/permission.rs`，工具执行层位于 `crates/xycli-core/src/tools/`。
 
 ## 1. 目标
 
@@ -15,15 +15,20 @@
 
 ## 2. 权限级别与模式
 
-```ts
-type PermissionLevel =
-  | "read-only"
-  | "write-files"
-  | "run-safe-commands"
-  | "network"
-  | "full-access";
+```rust
+pub enum PermissionLevel {
+    ReadOnly,
+    WriteFiles,
+    RunSafeCommands,
+    Network,
+    FullAccess,
+}
 
-type PermissionMode = "read-only" | "auto-safe" | "full-access";
+pub enum PermissionMode {
+    ReadOnly,
+    AutoSafe,
+    FullAccess,
+}
 ```
 
 | 模式 | 允许级别 |
@@ -34,26 +39,9 @@ type PermissionMode = "read-only" | "auto-safe" | "full-access";
 
 允许关系采用显式矩阵，不使用数值大小比较。未来增加权限级别时，新级别默认不会被旧模式放行。
 
-## 3. PermissionGuard 接口
+## 3. 权限判断接口
 
-```ts
-class PermissionGuard {
-  constructor(mode?: PermissionMode);
-  get mode(): PermissionMode;
-
-  static normalizeMode(mode: unknown): PermissionMode;
-  static allowedLevelsFor(mode: PermissionMode): readonly PermissionLevel[];
-  static check(level: PermissionLevel, mode?: PermissionMode): boolean;
-  static evaluate(level: PermissionLevel, mode?: PermissionMode): PermissionDecision;
-  static deniedPayload(params: DeniedParams): PermissionDeniedPayload;
-
-  check(level: PermissionLevel): boolean;
-  evaluate(level: PermissionLevel): PermissionDecision;
-  deniedPayload(params: Omit<DeniedParams, "mode">): PermissionDeniedPayload;
-}
-```
-
-非法模式抛出 `ValidationError`，不能静默回退到更宽松模式。
+`PermissionMode::allows(PermissionLevel)` 使用显式匹配表达式判断。非法 CLI 模式由 clap 在进入运行时前拒绝，不能静默回退到更宽松模式。
 
 ## 4. Agent Loop 集成
 
@@ -80,11 +68,10 @@ Provider 返回 tool call
 
 ## 5. ToolRegistry 输入校验
 
-每个工具同时声明 JSON Schema 和 Zod Validator。Registry 使用 Zod `safeParse()`：
+每个工具同时声明模型可见 JSON Schema 和 Rust 运行时校验逻辑。Registry 在执行入口统一处理：
 
-- 成功：使用解析后的数据执行；
+- 成功：使用已验证的数据执行；
 - 失败：返回 `INVALID_TOOL_INPUT` 和字段级问题；
-- 不调用 `idempotencyKey()`；
 - 不调用工具实现。
 
 ## 6. 文件动作级策略
@@ -119,7 +106,7 @@ Provider 返回 tool call
 
 第二个示例在 `full-access` 下可以执行，但在 `auto-safe` 下返回 `UNSAFE_COMMAND`。
 
-安全白名单及参数限制定义在 `terminal-exec.ts`。不能把 `npm test` 视为只读安全命令，因为 package script 可以执行任意代码。
+安全白名单及参数限制定义在 `crates/xycli-core/src/tools/terminal_exec.rs`。不能把 `cargo test` 视为只读安全命令，因为构建脚本和测试可以执行任意代码。
 
 ## 8. 测试矩阵
 

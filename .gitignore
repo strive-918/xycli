@@ -1,5 +1,3 @@
-node_modules/
-dist/
 .xycli/
-*.tsbuildinfo
 target/
+.DS_Store
