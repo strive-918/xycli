@@ -10,6 +10,7 @@ description = "XYCLI 的 Rust 核心运行时"
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 keyring.workspace = true
 reqwest.workspace = true

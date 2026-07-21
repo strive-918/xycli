@@ -1,14 +1,16 @@
 //! Anthropic Messages API 适配器。
 
-use std::{env, time::Duration};
+use std::{collections::BTreeMap, env, time::Duration};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
 use super::{
     ContentBlock, FinishReason, MessageContent, MessageRole, Provider, ProviderMessage,
-    ProviderRequest, ProviderResponse, TokenUsage, ToolCall, http_client, parse_http_response,
+    ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderStreamSink, TokenUsage,
+    ToolCall, http_client, parse_http_response,
 };
 use crate::error::{XycliError, XycliResult};
 
@@ -134,6 +136,232 @@ impl Provider for AnthropicProvider {
             response = send => response.map_err(|error| XycliError::provider(format!("Anthropic 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
         };
         Self::parse_response(parse_http_response(response, "Anthropic").await?)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ProviderRequest,
+        sink: &dyn ProviderStreamSink,
+    ) -> XycliResult<ProviderResponse> {
+        let mut body = Self::request_body(&request);
+        body["stream"] = Value::Bool(true);
+        let send = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send();
+        let response = tokio::select! {
+            _ = request.cancellation.cancelled() => return Err(XycliError::provider("Anthropic 请求已中断。", false)),
+            response = send => response.map_err(|error| XycliError::provider(format!("Anthropic 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
+        };
+        if !response.status().is_success() {
+            return Err(parse_http_response(response, "Anthropic")
+                .await
+                .unwrap_err());
+        }
+
+        #[derive(Debug)]
+        enum Block {
+            Text(String),
+            Tool {
+                id: String,
+                name: String,
+                arguments: String,
+            },
+        }
+
+        let mut decoder = super::stream::SseDecoder::default();
+        let mut chunks = response.bytes_stream();
+        let mut blocks = BTreeMap::<usize, Block>::new();
+        let mut usage = TokenUsage::default();
+        let mut finish_reason = FinishReason::Stop;
+        let mut saw_stop = false;
+        let mut emitted = false;
+
+        while let Some(chunk) = tokio::select! {
+            _ = request.cancellation.cancelled() => return Err(XycliError::provider("Anthropic 流已中断。", false)),
+            chunk = chunks.next() => chunk,
+        } {
+            let chunk = chunk.map_err(|error| {
+                XycliError::provider(format!("读取 Anthropic 流失败：{error}"), !emitted)
+            })?;
+            for data in decoder.push(&chunk)? {
+                if data == "[DONE]" {
+                    saw_stop = true;
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&data).map_err(|error| {
+                    XycliError::provider(format!("Anthropic 流事件不是有效 JSON：{error}"), false)
+                })?;
+                match value.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        usage.input_tokens = value
+                            .pointer("/message/usage/input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                    }
+                    Some("content_block_start") => {
+                        let index =
+                            value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let block = value.get("content_block").ok_or_else(|| {
+                            XycliError::provider("Anthropic 流缺少 content_block。", false)
+                        })?;
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let text = block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                if !text.is_empty() {
+                                    emitted = true;
+                                    sink.emit(ProviderStreamEvent::TextDelta {
+                                        text: text.clone(),
+                                    })
+                                    .await;
+                                }
+                                blocks.insert(index, Block::Text(text));
+                            }
+                            Some("tool_use") => {
+                                blocks.insert(
+                                    index,
+                                    Block::Tool {
+                                        id: block
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                        name: block
+                                            .get("name")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                        arguments: String::new(),
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        let index =
+                            value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        match value.pointer("/delta/type").and_then(Value::as_str) {
+                            Some("text_delta") => {
+                                let text = value
+                                    .pointer("/delta/text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if let Some(Block::Text(content)) = blocks.get_mut(&index) {
+                                    content.push_str(text);
+                                }
+                                if !text.is_empty() {
+                                    emitted = true;
+                                    sink.emit(ProviderStreamEvent::TextDelta {
+                                        text: text.to_owned(),
+                                    })
+                                    .await;
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                let partial = value
+                                    .pointer("/delta/partial_json")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if let Some(Block::Tool { arguments, .. }) = blocks.get_mut(&index)
+                                {
+                                    arguments.push_str(partial);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("message_delta") => {
+                        finish_reason = match value
+                            .pointer("/delta/stop_reason")
+                            .and_then(Value::as_str)
+                        {
+                            Some("tool_use") => FinishReason::ToolCalls,
+                            Some("max_tokens") => FinishReason::Length,
+                            Some("end_turn") | Some("stop_sequence") | None => FinishReason::Stop,
+                            _ => FinishReason::Error,
+                        };
+                        usage.output_tokens = value
+                            .pointer("/usage/output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(usage.output_tokens);
+                    }
+                    Some("message_stop") => saw_stop = true,
+                    Some("error") => {
+                        let message = value
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("未知流式错误");
+                        let retryable = value.pointer("/error/type").and_then(Value::as_str)
+                            == Some("overloaded_error")
+                            && !emitted;
+                        return Err(XycliError::provider(
+                            format!("Anthropic 流错误：{message}"),
+                            retryable,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for data in decoder.finish()? {
+            if data == "[DONE]" {
+                saw_stop = true;
+            }
+        }
+        if !saw_stop {
+            return Err(XycliError::provider(
+                "Anthropic 流在 message_stop 前结束。",
+                !emitted,
+            ));
+        }
+
+        let mut content = Vec::new();
+        let mut tool_calls = Vec::new();
+        for block in blocks.into_values() {
+            match block {
+                Block::Text(text) => content.push(ContentBlock::Text { text }),
+                Block::Tool {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let input: Value = serde_json::from_str(if arguments.is_empty() {
+                        "{}"
+                    } else {
+                        &arguments
+                    })
+                    .map_err(|error| {
+                        XycliError::provider(
+                            format!("Anthropic 流式工具参数不是有效 JSON：{error}"),
+                            false,
+                        )
+                    })?;
+                    content.push(ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                    tool_calls.push(ToolCall { id, name, input });
+                }
+            }
+        }
+        Ok(ProviderResponse {
+            message: ProviderMessage {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(content),
+            },
+            tool_calls,
+            usage,
+            finish_reason,
+        })
     }
 }
 

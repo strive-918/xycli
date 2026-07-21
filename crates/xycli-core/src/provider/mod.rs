@@ -3,6 +3,8 @@
 mod anthropic;
 mod deepseek;
 mod factory;
+mod retry;
+mod stream;
 
 use std::time::Duration;
 
@@ -17,6 +19,8 @@ use crate::error::{ErrorKind, XycliError, XycliResult};
 pub use anthropic::AnthropicProvider;
 pub use deepseek::DeepSeekProvider;
 pub use factory::{DefaultProviderFactory, ProviderFactory};
+pub use retry::RetryingProvider;
+pub use stream::{ProviderStreamEvent, ProviderStreamSink};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,6 +147,18 @@ pub struct ProviderResponse {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     async fn chat(&self, request: ProviderRequest) -> XycliResult<ProviderResponse>;
+    async fn stream_chat(
+        &self,
+        request: ProviderRequest,
+        sink: &dyn ProviderStreamSink,
+    ) -> XycliResult<ProviderResponse> {
+        let response = self.chat(request).await?;
+        let text = response.message.text_content();
+        if !text.is_empty() {
+            sink.emit(ProviderStreamEvent::TextDelta { text }).await;
+        }
+        Ok(response)
+    }
     fn supports_tools(&self, _model: &str) -> bool {
         true
     }
@@ -171,6 +187,12 @@ pub(super) async fn parse_http_response(
         .or_else(|| response.headers().get("x-request-id"))
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let retry_after_ms = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000));
     let text = response.text().await.map_err(|error| {
         XycliError::provider(format!("读取 {provider} 响应失败：{error}"), true)
     })?;
@@ -193,7 +215,11 @@ pub(super) async fn parse_http_response(
                 status.as_u16()
             ),
             retryable: retryable_status(status),
-            details: json!({ "status": status.as_u16(), "requestId": request_id }),
+            details: json!({
+                "status": status.as_u16(),
+                "requestId": request_id,
+                "retryAfterMs": retry_after_ms,
+            }),
         });
     }
 

@@ -137,6 +137,7 @@ struct Runtime {
     registry: ToolRegistry,
     store: JsonSessionStore,
     renderer: ConsoleRenderer,
+    stream: bool,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -181,6 +182,7 @@ async fn create_runtime(cwd: PathBuf, resolved: &ResolvedConfig) -> Result<Runti
             !resolved.config.output.no_stream,
             resolved.config.output.color && io::stdout().is_terminal(),
         ),
+        stream: !resolved.config.output.no_stream,
     })
 }
 
@@ -203,6 +205,7 @@ async fn execute_prompt(
         cancellation: cancellation.clone(),
         session_id,
         event_sink: Some(&runtime.renderer),
+        stream: runtime.stream,
     });
     tokio::pin!(run);
     tokio::select! {
@@ -328,6 +331,11 @@ fn config_value(resolved: &ResolvedConfig, key: &str) -> Option<String> {
                 .unwrap_or_else(|| "<默认端点>".into()),
         ),
         "provider.timeout_seconds" => Some(resolved.config.provider.timeout_seconds.to_string()),
+        "provider.max_attempts" => Some(resolved.config.provider.max_attempts.to_string()),
+        "provider.retry_base_ms" => Some(resolved.config.provider.retry_base_ms.to_string()),
+        "provider.min_request_interval_ms" => {
+            Some(resolved.config.provider.min_request_interval_ms.to_string())
+        }
         "agent.max_turns" => Some(resolved.config.agent.max_turns.to_string()),
         "agent.permission" => Some(resolved.config.agent.permission.clone()),
         "output.json" => Some(resolved.config.output.json.to_string()),

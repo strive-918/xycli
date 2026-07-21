@@ -47,6 +47,9 @@ pub struct ProviderConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub timeout_seconds: u64,
+    pub max_attempts: u32,
+    pub retry_base_ms: u64,
+    pub min_request_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,6 +123,9 @@ struct FileProvider {
     model: Option<String>,
     base_url: Option<String>,
     timeout_seconds: Option<u64>,
+    max_attempts: Option<u32>,
+    retry_base_ms: Option<u64>,
+    min_request_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -246,6 +252,27 @@ fn apply_file(
         sources,
     );
     set(
+        &mut config.provider.max_attempts,
+        &file.provider.max_attempts,
+        "provider.max_attempts",
+        source,
+        sources,
+    );
+    set(
+        &mut config.provider.retry_base_ms,
+        &file.provider.retry_base_ms,
+        "provider.retry_base_ms",
+        source,
+        sources,
+    );
+    set(
+        &mut config.provider.min_request_interval_ms,
+        &file.provider.min_request_interval_ms,
+        "provider.min_request_interval_ms",
+        source,
+        sources,
+    );
+    set(
         &mut config.agent.max_turns,
         &file.agent.max_turns,
         "agent.max_turns",
@@ -299,6 +326,15 @@ fn env_file(provider: &str) -> FileConfig {
             timeout_seconds: env::var("XYCLI_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            max_attempts: env::var("XYCLI_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            retry_base_ms: env::var("XYCLI_RETRY_BASE_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            min_request_interval_ms: env::var("XYCLI_MIN_REQUEST_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         },
         agent: FileAgent {
             max_turns: env::var("XYCLI_MAX_TURNS")
@@ -342,6 +378,17 @@ fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XycliResult<()>
     if !(1..=600).contains(&config.provider.timeout_seconds) {
         return Err(config_error("provider.timeout_seconds 必须是 1 到 600。"));
     }
+    if !(1..=10).contains(&config.provider.max_attempts) {
+        return Err(config_error("provider.max_attempts 必须是 1 到 10。"));
+    }
+    if !(10..=30_000).contains(&config.provider.retry_base_ms) {
+        return Err(config_error("provider.retry_base_ms 必须是 10 到 30000。"));
+    }
+    if config.provider.min_request_interval_ms > 60_000 {
+        return Err(config_error(
+            "provider.min_request_interval_ms 必须是 0 到 60000。",
+        ));
+    }
     config.agent.permission.parse::<PermissionMode>()?;
     if let Some(base_url) = &config.provider.base_url
         && !(base_url.starts_with("https://")
@@ -373,6 +420,9 @@ fn load_config_from_paths(
             model: DEFAULT_ANTHROPIC_MODEL.into(),
             base_url: None,
             timeout_seconds: 180,
+            max_attempts: 3,
+            retry_base_ms: 500,
+            min_request_interval_ms: 0,
         },
         agent: AgentConfig {
             max_turns: 25,
@@ -389,6 +439,9 @@ fn load_config_from_paths(
         ("provider.model", ConfigSource::Default),
         ("provider.base_url", ConfigSource::Default),
         ("provider.timeout_seconds", ConfigSource::Default),
+        ("provider.max_attempts", ConfigSource::Default),
+        ("provider.retry_base_ms", ConfigSource::Default),
+        ("provider.min_request_interval_ms", ConfigSource::Default),
         ("agent.max_turns", ConfigSource::Default),
         ("agent.permission", ConfigSource::Default),
         ("output.json", ConfigSource::Default),
@@ -421,6 +474,9 @@ fn load_config_from_paths(
             model: overrides.model,
             base_url: overrides.base_url,
             timeout_seconds: None,
+            max_attempts: None,
+            retry_base_ms: None,
+            min_request_interval_ms: None,
         },
         agent: FileAgent {
             max_turns: overrides.max_turns,
@@ -479,6 +535,9 @@ pub fn write_config_value(
                 | "provider.model"
                 | "provider.base_url"
                 | "provider.timeout_seconds"
+                | "provider.max_attempts"
+                | "provider.retry_base_ms"
+                | "provider.min_request_interval_ms"
                 | "agent.max_turns"
                 | "agent.permission"
                 | "output.json"
@@ -509,14 +568,24 @@ pub fn write_config_value(
         }
         _ => {}
     }
-    let parsed = if matches!(key, "provider.timeout_seconds" | "agent.max_turns") {
+    let parsed = if matches!(
+        key,
+        "provider.timeout_seconds"
+            | "provider.max_attempts"
+            | "provider.retry_base_ms"
+            | "provider.min_request_interval_ms"
+            | "agent.max_turns"
+    ) {
         let number = raw_value
             .parse::<i64>()
             .map_err(|_| config_error(format!("{key} 必须是整数。")))?;
-        let valid = if key == "agent.max_turns" {
-            (1..=100).contains(&number)
-        } else {
-            (1..=600).contains(&number)
+        let valid = match key {
+            "agent.max_turns" => (1..=100).contains(&number),
+            "provider.timeout_seconds" => (1..=600).contains(&number),
+            "provider.max_attempts" => (1..=10).contains(&number),
+            "provider.retry_base_ms" => (10..=30_000).contains(&number),
+            "provider.min_request_interval_ms" => (0..=60_000).contains(&number),
+            _ => false,
         };
         if !valid {
             return Err(config_error(format!("{key} 超出允许范围。")));

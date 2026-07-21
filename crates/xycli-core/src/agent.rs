@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +15,7 @@ use crate::{
     prompt::build_system_prompt,
     provider::{
         ContentBlock, FinishReason, MessageContent, MessageRole, Provider, ProviderMessage,
-        ProviderRequest,
+        ProviderRequest, ProviderStreamEvent, ProviderStreamSink,
     },
     session::{
         AgentLoopState, Message, Session, SessionStatus, SessionStore, ToolCallRecord,
@@ -35,6 +36,22 @@ pub struct AgentRunConfig<'a> {
     pub cancellation: CancellationToken,
     pub session_id: Option<Uuid>,
     pub event_sink: Option<&'a dyn EventSink>,
+    pub stream: bool,
+}
+
+struct AgentProviderSink<'a> {
+    sink: Option<&'a dyn EventSink>,
+}
+
+#[async_trait]
+impl ProviderStreamSink for AgentProviderSink<'_> {
+    async fn emit(&self, event: ProviderStreamEvent) {
+        match event {
+            ProviderStreamEvent::TextDelta { text } => {
+                emit(self.sink, AgentEvent::AssistantDelta { text }).await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -191,20 +208,30 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
         };
         session.current_state = state;
         emit(config.event_sink, AgentEvent::StateChanged { state }).await;
-        let response = match config
-            .provider
-            .chat(ProviderRequest {
-                session_id: session.id.to_string(),
-                model: config.model.clone(),
-                messages: provider_messages(&session),
-                tools: provider_tools.clone(),
-                system: system.clone(),
-                temperature: 0.2,
-                max_output_tokens: 4096,
-                cancellation: config.cancellation.child_token(),
-            })
-            .await
-        {
+        let request = ProviderRequest {
+            session_id: session.id.to_string(),
+            model: config.model.clone(),
+            messages: provider_messages(&session),
+            tools: provider_tools.clone(),
+            system: system.clone(),
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            cancellation: config.cancellation.child_token(),
+        };
+        let response_result = if config.stream {
+            config
+                .provider
+                .stream_chat(
+                    request,
+                    &AgentProviderSink {
+                        sink: config.event_sink,
+                    },
+                )
+                .await
+        } else {
+            config.provider.chat(request).await
+        };
+        let response = match response_result {
             Ok(response) => response,
             Err(error) => {
                 status = if config.cancellation.is_cancelled() {
@@ -236,7 +263,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
         )
         .await;
         let assistant_text = response.message.text_content();
-        if !assistant_text.is_empty() {
+        if !config.stream && !assistant_text.is_empty() {
             emit(
                 config.event_sink,
                 AgentEvent::AssistantDelta {
@@ -469,6 +496,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             session_id: None,
             event_sink: None,
+            stream: false,
         }
     }
 

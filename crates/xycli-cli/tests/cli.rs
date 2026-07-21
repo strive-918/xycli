@@ -57,6 +57,16 @@ fn write_http_json(stream: &mut std::net::TcpStream, body: serde_json::Value) {
     .unwrap();
 }
 
+fn write_http_sse(stream: &mut std::net::TcpStream, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+}
+
 fn two_turn_anthropic_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -80,6 +90,41 @@ fn two_turn_anthropic_server() -> String {
                 "stop_reason":"end_turn",
                 "usage":{"input_tokens":2,"output_tokens":2}
             }),
+        );
+    });
+    format!("http://{address}")
+}
+
+fn two_turn_anthropic_sse_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_http_request(&mut first);
+        write_http_sse(
+            &mut first,
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"file_read\",\"input\":{}}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"fixture.txt\\\"}\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        );
+        let (mut second, _) = listener.accept().unwrap();
+        read_http_request(&mut second);
+        write_http_sse(
+            &mut second,
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Rust CLI \"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"SSE 完成\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
         );
     });
     format!("http://{address}")
@@ -172,6 +217,7 @@ fn rust_cli_真实进程完成工具循环并保存会话() {
         .current_dir(dir.path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", base_url)
+        .env("XYCLI_NO_STREAM", "true")
         .arg("读取 fixture.txt")
         .output()
         .unwrap();
@@ -204,7 +250,7 @@ fn json_模式只输出可解析事件且没有横幅() {
         .current_dir(dir.path())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_BASE_URL", two_turn_anthropic_server())
-        .args(["--json", "读取 fixture.txt"])
+        .args(["--json", "--no-stream", "读取 fixture.txt"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -232,4 +278,24 @@ fn no_stream_只在完成时打印最终文本() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.matches("Rust CLI E2E 完成").count(), 1);
+}
+
+#[test]
+fn 默认流式模式聚合工具参数并增量输出文本() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("fixture.txt"), "fixture content").unwrap();
+    let output = xycli()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_sse_server())
+        .arg("读取 fixture.txt")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("Rust CLI SSE 完成").count(), 1);
 }

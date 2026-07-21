@@ -1,14 +1,16 @@
 //! DeepSeek 的 OpenAI Chat Completions 兼容适配器。
 
-use std::{env, time::Duration};
+use std::{collections::BTreeMap, env, time::Duration};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
 use super::{
     ContentBlock, FinishReason, MessageContent, MessageRole, Provider, ProviderMessage,
-    ProviderRequest, ProviderResponse, TokenUsage, ToolCall, http_client, parse_http_response,
+    ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderStreamSink, TokenUsage,
+    ToolCall, http_client, parse_http_response,
 };
 use crate::error::{XycliError, XycliResult};
 
@@ -218,6 +220,168 @@ impl Provider for DeepSeekProvider {
             response = send => response.map_err(|error| XycliError::provider(format!("DeepSeek 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
         };
         Self::parse_response(parse_http_response(response, "DeepSeek").await?)
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ProviderRequest,
+        sink: &dyn ProviderStreamSink,
+    ) -> XycliResult<ProviderResponse> {
+        let mut body = Self::request_body(&request)?;
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = json!({ "include_usage": true });
+        let send = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send();
+        let response = tokio::select! {
+            _ = request.cancellation.cancelled() => return Err(XycliError::provider("DeepSeek 请求已中断。", false)),
+            response = send => response.map_err(|error| XycliError::provider(format!("DeepSeek 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
+        };
+        if !response.status().is_success() {
+            return Err(parse_http_response(response, "DeepSeek").await.unwrap_err());
+        }
+
+        #[derive(Debug, Default)]
+        struct ToolAccumulator {
+            id: String,
+            name: String,
+            arguments: String,
+        }
+
+        let mut decoder = super::stream::SseDecoder::default();
+        let mut chunks = response.bytes_stream();
+        let mut text = String::new();
+        let mut tools = BTreeMap::<usize, ToolAccumulator>::new();
+        let mut usage = TokenUsage::default();
+        let mut finish_reason = FinishReason::Stop;
+        let mut saw_done = false;
+        let mut emitted = false;
+
+        while let Some(chunk) = tokio::select! {
+            _ = request.cancellation.cancelled() => return Err(XycliError::provider("DeepSeek 流已中断。", false)),
+            chunk = chunks.next() => chunk,
+        } {
+            let chunk = chunk.map_err(|error| {
+                XycliError::provider(format!("读取 DeepSeek 流失败：{error}"), !emitted)
+            })?;
+            for data in decoder.push(&chunk)? {
+                if data == "[DONE]" {
+                    saw_done = true;
+                    continue;
+                }
+                let value: Value = serde_json::from_str(&data).map_err(|error| {
+                    XycliError::provider(format!("DeepSeek 流事件不是有效 JSON：{error}"), false)
+                })?;
+                if let Some(input_tokens) = value
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    usage.input_tokens = input_tokens;
+                }
+                if let Some(output_tokens) = value
+                    .pointer("/usage/completion_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    usage.output_tokens = output_tokens;
+                }
+                let Some(choice) = value.pointer("/choices/0") else {
+                    continue;
+                };
+                if let Some(delta) = choice.pointer("/delta/content").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        emitted = true;
+                        text.push_str(delta);
+                        sink.emit(ProviderStreamEvent::TextDelta {
+                            text: delta.to_owned(),
+                        })
+                        .await;
+                    }
+                }
+                for call in choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let accumulator = tools.entry(index).or_default();
+                    if let Some(id) = call.get("id").and_then(Value::as_str)
+                        && accumulator.id.is_empty()
+                    {
+                        accumulator.id.push_str(id);
+                    }
+                    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                        accumulator.name.push_str(name);
+                    }
+                    if let Some(arguments) =
+                        call.pointer("/function/arguments").and_then(Value::as_str)
+                    {
+                        accumulator.arguments.push_str(arguments);
+                    }
+                }
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    finish_reason = match reason {
+                        "tool_calls" => FinishReason::ToolCalls,
+                        "length" => FinishReason::Length,
+                        "content_filter" => FinishReason::ContentFilter,
+                        "stop" => FinishReason::Stop,
+                        _ => FinishReason::Error,
+                    };
+                }
+            }
+        }
+        for data in decoder.finish()? {
+            if data == "[DONE]" {
+                saw_done = true;
+            }
+        }
+        if !saw_done {
+            return Err(XycliError::provider(
+                "DeepSeek 流在 [DONE] 前结束。",
+                !emitted,
+            ));
+        }
+
+        let mut blocks = Vec::new();
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text { text });
+        }
+        let mut tool_calls = Vec::new();
+        for tool in tools.into_values() {
+            let input: Value = serde_json::from_str(if tool.arguments.is_empty() {
+                "{}"
+            } else {
+                &tool.arguments
+            })
+            .map_err(|error| {
+                XycliError::provider(
+                    format!("DeepSeek 流式工具参数不是有效 JSON：{error}"),
+                    false,
+                )
+            })?;
+            blocks.push(ContentBlock::ToolUse {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                input: input.clone(),
+            });
+            tool_calls.push(ToolCall {
+                id: tool.id,
+                name: tool.name,
+                input,
+            });
+        }
+        Ok(ProviderResponse {
+            message: ProviderMessage {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(blocks),
+            },
+            tool_calls,
+            usage,
+            finish_reason,
+        })
     }
 }
 
