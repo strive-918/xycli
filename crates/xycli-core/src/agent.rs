@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ErrorKind, XycliError, XycliResult},
+    events::{AgentEvent, EventSink, emit},
     permission::PermissionMode,
     prompt::build_system_prompt,
     provider::{
@@ -33,6 +34,7 @@ pub struct AgentRunConfig<'a> {
     pub permission_mode: PermissionMode,
     pub cancellation: CancellationToken,
     pub session_id: Option<Uuid>,
+    pub event_sink: Option<&'a dyn EventSink>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +190,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
             AgentLoopState::Acting
         };
         session.current_state = state;
+        emit(config.event_sink, AgentEvent::StateChanged { state }).await;
         let response = match config
             .provider
             .chat(ProviderRequest {
@@ -225,7 +228,23 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
         };
         session.total_input_tokens += response.usage.input_tokens;
         session.total_output_tokens += response.usage.output_tokens;
+        emit(
+            config.event_sink,
+            AgentEvent::UsageUpdated {
+                usage: response.usage.clone(),
+            },
+        )
+        .await;
         let assistant_text = response.message.text_content();
+        if !assistant_text.is_empty() {
+            emit(
+                config.event_sink,
+                AgentEvent::AssistantDelta {
+                    text: assistant_text.clone(),
+                },
+            )
+            .await;
+        }
         session.messages.push(Message {
             id: Uuid::new_v4(),
             role: MessageRole::Assistant,
@@ -255,6 +274,14 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
                         "\n\n"
                     }
                 );
+                emit(
+                    config.event_sink,
+                    AgentEvent::Warning {
+                        code: "OUTPUT_TRUNCATED".into(),
+                        message: "模型输出因长度限制被截断。".into(),
+                    },
+                )
+                .await;
             }
             FinishReason::ToolCalls if !response.tool_calls.is_empty() => {
                 state = AgentLoopState::Acting;
@@ -267,6 +294,14 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
                         break;
                     }
                     let started_at = Utc::now();
+                    emit(
+                        config.event_sink,
+                        AgentEvent::ToolStarted {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                        },
+                    )
+                    .await;
                     let result = config
                         .tool_registry
                         .execute(
@@ -278,6 +313,15 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
                             config.cancellation.child_token(),
                         )
                         .await;
+                    emit(
+                        config.event_sink,
+                        AgentEvent::ToolFinished {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            result: result.clone(),
+                        },
+                    )
+                    .await;
                     let error_code = result.error.as_ref().map(|error| error.code.as_str());
                     let record_status = if result.success {
                         ToolCallStatus::Succeeded
@@ -335,7 +379,16 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
         state = AgentLoopState::Incomplete;
         exit_code = 1;
         final_message = format!("已达到最大轮次 {}，任务尚未确认完成。", config.max_turns);
+        emit(
+            config.event_sink,
+            AgentEvent::Warning {
+                code: "MAX_TURNS_REACHED".into(),
+                message: final_message.clone(),
+            },
+        )
+        .await;
     }
+    emit(config.event_sink, AgentEvent::StateChanged { state }).await;
     session.status = status;
     session.current_state = state;
     session.updated_at = Utc::now();
@@ -415,6 +468,7 @@ mod tests {
             permission_mode: PermissionMode::AutoSafe,
             cancellation: CancellationToken::new(),
             session_id: None,
+            event_sink: None,
         }
     }
 

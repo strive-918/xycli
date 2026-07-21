@@ -7,6 +7,7 @@ pub mod agent;
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod events;
 pub mod permission;
 pub mod prompt;
 pub mod provider;
@@ -22,6 +23,7 @@ pub use credentials::{
     KeyringSecretStore, SecretSource, SecretStore, SecretString, resolve_secret,
 };
 pub use error::{ErrorKind, XycliError, XycliResult};
+pub use events::{AgentEvent, EventSink, NoopEventSink};
 pub use permission::{PermissionLevel, PermissionMode};
 pub use provider::{
     AnthropicProvider, DeepSeekProvider, DefaultProviderFactory, Provider, ProviderFactory,

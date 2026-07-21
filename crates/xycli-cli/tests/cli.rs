@@ -195,3 +195,41 @@ fn rust_cli_真实进程完成工具循环并保存会话() {
     assert_eq!(session["toolCalls"][0]["toolName"], "file_read");
     assert_eq!(session["toolCalls"][0]["status"], "succeeded");
 }
+
+#[test]
+fn json_模式只输出可解析事件且没有横幅() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("fixture.txt"), "fixture content").unwrap();
+    let output = xycli()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_server())
+        .args(["--json", "读取 fixture.txt"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("XYCLI v"));
+    let events = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| event["type"] == "tool_started"));
+    assert!(events.iter().any(|event| event["type"] == "run_completed"));
+}
+
+#[test]
+fn no_stream_只在完成时打印最终文本() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("fixture.txt"), "fixture content").unwrap();
+    let output = xycli()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_server())
+        .args(["--no-stream", "读取 fixture.txt"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("Rust CLI E2E 完成").count(), 1);
+}

@@ -1,5 +1,7 @@
 //! XYCLI Rust 命令行入口。
 
+mod renderer;
+
 use std::{
     env,
     io::{self, IsTerminal, Write},
@@ -17,6 +19,8 @@ use xycli_core::{
     SecretStore, SecretString, ToolRegistry, XycliError, config_paths, load_config,
     register_builtins, resolve_secret, run_agent, write_config_value,
 };
+
+use crate::renderer::ConsoleRenderer;
 
 #[derive(Debug, Parser)]
 #[command(name = "xycli", version, about = "终端原生 AI 编程助手")]
@@ -132,6 +136,7 @@ struct Runtime {
     permission_mode: PermissionMode,
     registry: ToolRegistry,
     store: JsonSessionStore,
+    renderer: ConsoleRenderer,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -171,6 +176,11 @@ async fn create_runtime(cwd: PathBuf, resolved: &ResolvedConfig) -> Result<Runti
         permission_mode: resolved.config.agent.permission_mode()?,
         registry,
         store: JsonSessionStore::new(&cwd),
+        renderer: ConsoleRenderer::new(
+            resolved.config.output.json,
+            !resolved.config.output.no_stream,
+            resolved.config.output.color && io::stdout().is_terminal(),
+        ),
     })
 }
 
@@ -179,6 +189,7 @@ async fn execute_prompt(
     prompt: String,
     session_id: Option<Uuid>,
 ) -> Result<AgentRunResult, XycliError> {
+    runtime.renderer.begin_run();
     let cancellation = CancellationToken::new();
     let run = run_agent(AgentRunConfig {
         prompt,
@@ -191,6 +202,7 @@ async fn execute_prompt(
         permission_mode: runtime.permission_mode,
         cancellation: cancellation.clone(),
         session_id,
+        event_sink: Some(&runtime.renderer),
     });
     tokio::pin!(run);
     tokio::select! {
@@ -229,9 +241,7 @@ async fn interactive_loop(
     let mut session_id = initial_session;
     if let Some(prompt) = initial_prompt {
         let result = execute_prompt(&runtime, prompt, session_id).await?;
-        if !result.final_message.is_empty() {
-            println!("\n{}", result.final_message);
-        }
+        runtime.renderer.finish_run(&result)?;
         session_id = Some(result.session_id);
     }
 
@@ -285,9 +295,7 @@ async fn interactive_loop(
             continue;
         }
         let result = execute_prompt(&runtime, input.to_owned(), session_id).await?;
-        if !result.final_message.is_empty() {
-            println!("\n{}", result.final_message);
-        }
+        runtime.renderer.finish_run(&result)?;
         session_id = Some(result.session_id);
     }
     Ok(0)
@@ -444,7 +452,14 @@ async fn run() -> Result<u8, XycliError> {
     let piped = !io::stdin().is_terminal();
     let prompt = command_prompt.or(cli.prompt);
     let interactive = cli.interactive || (prompt.is_none() && !piped);
-    print_banner(&runtime, interactive);
+    if resolved.config.output.json && interactive {
+        return Err(XycliError::validation(
+            "--json 仅支持非交互模式，请同时提供 prompt 或管道输入。",
+        ));
+    }
+    if !resolved.config.output.json {
+        print_banner(&runtime, interactive);
+    }
     if interactive {
         return interactive_loop(runtime, prompt, cli.session).await;
     }
@@ -462,9 +477,7 @@ async fn run() -> Result<u8, XycliError> {
         return Err(XycliError::validation("prompt 不能为空。"));
     }
     let result = execute_prompt(&runtime, prompt, cli.session).await?;
-    if !result.final_message.is_empty() {
-        println!("\n{}", result.final_message);
-    }
+    runtime.renderer.finish_run(&result)?;
     Ok(result.exit_code)
 }
 
